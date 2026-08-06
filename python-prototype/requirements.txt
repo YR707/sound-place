@@ -1,0 +1,5 @@
+numpy>=2.0
+scipy>=1.13
+pycaw>=20230407
+comtypes>=1.4
+psutil>=5.9

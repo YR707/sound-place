@@ -36,3 +36,16 @@ Thumbs.db
 
 # Tauri dev 缓存
 /src-tauri/WixTools/
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Python 原型本地配置
+/python-prototype/.env
+/python-prototype/recordings/
