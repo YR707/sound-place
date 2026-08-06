@@ -6,119 +6,51 @@
 // - Tab 切换: Profile 管理 / 外观设置 / 帮助 / 关于
 // - 首次启动: 全屏 RiskNotice 弹窗
 
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import RiskNotice from './RiskNotice.vue';
 import AppearanceSettings from './AppearanceSettings.vue';
 import HelpPage from './HelpPage.vue';
 import AboutPage from './AboutPage.vue';
-import type { ProfileListItem } from '@/types/profile';
+import ProfileList from '@/components/ProfileList.vue';
+import ProfileEditor from '@/components/ProfileEditor.vue';
+import { useProfileManager } from '@/composables/useProfileManager';
+import { useCaptureControl } from '@/composables/useCaptureControl';
 
 type Tab = 'profile' | 'appearance' | 'help' | 'about';
 
 const riskAccepted = ref(false);
-const capturing = ref(false);
-const overlayEnabled = ref(false);
-const errorMsg = ref('');
 const activeTab = ref<Tab>('profile');
+const globalError = ref('');
 
-// Profile 管理
-const profiles = ref<ProfileListItem[]>([]);
-const activeProfileId = ref('default');
-const editingProfileId = ref<string | null>(null);
-const editingContent = ref('');
-const editingError = ref('');
+const {
+  profiles,
+  activeProfileId,
+  editingProfileId,
+  editingContent,
+  error: profileError,
+  loadProfiles,
+  editProfile,
+  saveProfile,
+  activateProfile,
+  cancelEdit,
+} = useProfileManager();
 
-async function loadProfiles() {
-  try {
-    profiles.value = await invoke<ProfileListItem[]>('list_profiles');
-    activeProfileId.value = await invoke<string>('get_active_profile');
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
+const {
+  capturing,
+  overlayEnabled,
+  error: captureError,
+  startCapture,
+  stopCapture,
+  enableOverlay,
+  disableOverlay,
+  editPosition,
+} = useCaptureControl();
 
-async function editProfile(id: string) {
-  try {
-    editingProfileId.value = id;
-    editingContent.value = await invoke<string>('get_profile', { id });
-    editingError.value = '';
-  } catch (e) {
-    editingError.value = String(e);
-  }
-}
-
-async function saveProfile() {
-  if (!editingProfileId.value) return;
-  try {
-    await invoke('save_profile', {
-      id: editingProfileId.value,
-      content: editingContent.value,
-    });
-    editingError.value = '';
-    await loadProfiles();
-  } catch (e) {
-    editingError.value = String(e);
-  }
-}
-
-async function activateProfile(id: string) {
-  try {
-    await invoke('set_active_profile', { id });
-    activeProfileId.value = id;
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
-
-// 控制
-async function startCapture() {
-  try {
-    await invoke('start_capture');
-    capturing.value = true;
-    errorMsg.value = '';
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
-
-async function stopCapture() {
-  try {
-    await invoke('stop_capture');
-    capturing.value = false;
-    errorMsg.value = '';
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
-
-async function enableOverlay() {
-  try {
-    await invoke('enable_overlay');
-    overlayEnabled.value = true;
-    errorMsg.value = '';
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
-
-async function disableOverlay() {
-  try {
-    await invoke('disable_overlay');
-    overlayEnabled.value = false;
-    errorMsg.value = '';
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
-
-async function editPosition() {
-  try {
-    await invoke('enter_edit_mode');
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
+// 合并错误显示: 全局错误优先, 其次 Profile 错误, 最后捕获错误
+const errorMsg = computed(() =>
+  globalError.value || profileError.value || captureError.value
+);
 
 onMounted(async () => {
   try {
@@ -127,7 +59,7 @@ onMounted(async () => {
       await loadProfiles();
     }
   } catch (e) {
-    errorMsg.value = String(e);
+    globalError.value = String(e);
   }
 });
 
@@ -135,12 +67,6 @@ async function onRiskAccepted() {
   riskAccepted.value = true;
   await loadProfiles();
 }
-
-const riskClass = (risk: string) => {
-  if (risk === 'high') return 'risk-high';
-  if (risk === 'medium') return 'risk-medium';
-  return 'risk-low';
-};
 </script>
 
 <template>
@@ -202,40 +128,21 @@ const riskClass = (risk: string) => {
       <div class="tab-content">
         <!-- Profile 管理 -->
         <div v-if="activeTab === 'profile'" class="profile-tab">
-          <div class="profile-list">
-            <h4>Profiles</h4>
-            <div
-              v-for="p in profiles"
-              :key="p.game_id"
-              class="profile-item"
-              :class="{ active: p.game_id === activeProfileId }"
-            >
-              <div class="profile-info">
-                <div class="profile-name">{{ p.name }}</div>
-                <div class="profile-id">{{ p.game_id }}</div>
-                <span class="risk-tag" :class="riskClass(p.anticheat_risk)">
-                  {{ p.anticheat_risk }}
-                </span>
-              </div>
-              <div class="profile-actions">
-                <button @click="editProfile(p.game_id)">编辑</button>
-                <button
-                  v-if="p.game_id !== activeProfileId"
-                  @click="activateProfile(p.game_id)"
-                >激活</button>
-                <span v-else class="active-tag">已激活</span>
-              </div>
-            </div>
-          </div>
-
-          <div class="profile-editor" v-if="editingProfileId">
-            <div class="editor-header">
-              <h4>编辑: {{ editingProfileId }}.toml</h4>
-              <button @click="saveProfile">保存</button>
-            </div>
-            <textarea v-model="editingContent" class="toml-editor"></textarea>
-            <div v-if="editingError" class="error-bar">{{ editingError }}</div>
-          </div>
+          <ProfileList
+            :profiles="profiles"
+            :active-profile-id="activeProfileId"
+            @edit="editProfile"
+            @activate="activateProfile"
+          />
+          <ProfileEditor
+            v-if="editingProfileId"
+            :profile-id="editingProfileId"
+            :content="editingContent"
+            :error="profileError"
+            @update:content="editingContent = $event"
+            @save="saveProfile"
+            @cancel="cancelEdit"
+          />
         </div>
 
         <!-- 外观设置 -->
@@ -344,125 +251,5 @@ const riskClass = (risk: string) => {
   display: flex;
   gap: 16px;
   height: 100%;
-}
-
-.profile-list {
-  width: 280px;
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
-  border-radius: 4px;
-  padding: 12px;
-  overflow-y: auto;
-}
-
-.profile-list h4 {
-  margin: 0 0 10px;
-  color: #fff;
-  font-size: 14px;
-}
-
-.profile-item {
-  padding: 8px;
-  margin-bottom: 6px;
-  background: #222;
-  border-radius: 3px;
-  cursor: pointer;
-  border: 1px solid transparent;
-}
-
-.profile-item.active {
-  border-color: #44a4ff;
-}
-
-.profile-info {
-  margin-bottom: 6px;
-}
-
-.profile-name {
-  color: #fff;
-  font-size: 13px;
-}
-
-.profile-id {
-  color: #888;
-  font-size: 11px;
-  font-family: monospace;
-}
-
-.risk-tag {
-  display: inline-block;
-  padding: 1px 6px;
-  border-radius: 2px;
-  font-size: 10px;
-  margin-top: 2px;
-}
-
-.risk-high { background: #4a1f1f; color: #ef476f; }
-.risk-medium { background: #4a401f; color: #ffd166; }
-.risk-low { background: #1f4a2f; color: #06d6a0; }
-
-.profile-actions {
-  display: flex;
-  gap: 6px;
-}
-
-.profile-actions button {
-  background: #333;
-  color: #ddd;
-  border: 1px solid #444;
-  padding: 3px 8px;
-  border-radius: 2px;
-  cursor: pointer;
-  font-size: 11px;
-}
-
-.active-tag {
-  color: #06d6a0;
-  font-size: 11px;
-}
-
-.profile-editor {
-  flex: 1;
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
-  border-radius: 4px;
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-}
-
-.editor-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
-}
-
-.editor-header h4 {
-  margin: 0;
-  color: #fff;
-  font-size: 14px;
-}
-
-.editor-header button {
-  background: #44a4ff;
-  color: white;
-  border: none;
-  padding: 4px 12px;
-  border-radius: 3px;
-  cursor: pointer;
-  font-size: 12px;
-}
-
-.toml-editor {
-  flex: 1;
-  background: #111;
-  color: #ddd;
-  border: 1px solid #333;
-  border-radius: 3px;
-  padding: 8px;
-  font-family: 'Consolas', monospace;
-  font-size: 12px;
-  resize: none;
 }
 </style>
