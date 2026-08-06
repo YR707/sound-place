@@ -1,0 +1,42 @@
+# PUBG profile
+# 反作弊: BattlEye (中等风险)
+# 特点: 大地图, 载具与远距离枪声重要
+
+game_id = "pubg"
+name = "PUBG"
+process_names = ["TslGame"]
+anticheat_risk = "medium"
+
+[detection]
+fft_size = 2048
+hop_size = 1024
+onset_threshold = 3.0
+min_event_interval_ms = 100
+
+[[sound_types]]
+name = "footstep"
+freq_range = [80, 400]
+min_energy_ratio = 0.4
+min_duration_ms = 20
+max_duration_ms = 200
+
+[[sound_types]]
+name = "gunshot"
+freq_range = [1500, 12000]
+min_energy_ratio = 0.3
+min_duration_ms = 5
+max_duration_ms = 150
+
+[[sound_types]]
+name = "vehicle"
+freq_range = [40, 250]
+min_energy_ratio = 0.55
+min_duration_ms = 1000
+max_duration_ms = 30000
+
+[[sound_types]]
+name = "generic"
+freq_range = [0, 24000]
+min_energy_ratio = 0.0
+min_duration_ms = 0
+max_duration_ms = 1000

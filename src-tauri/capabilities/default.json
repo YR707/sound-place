@@ -11,10 +11,13 @@
     "core:window:allow-set-always-on-top",
     "core:window:allow-set-position",
     "core:window:allow-set-size",
+    "core:window:allow-close",
     "core:webview:allow-emit",
     "core:webview:allow-listen",
     "core:event:default",
+    "core:tray:default",
     "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister"
+    "global-shortcut:allow-unregister",
+    "global-shortcut:default"
   ]
 }

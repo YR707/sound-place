@@ -1,0 +1,42 @@
+# 默认通用 profile (无特定游戏优化)
+# 用于学习音频分析, 不绑定特定游戏进程
+
+game_id = "default"
+name = "通用(学习模式)"
+process_names = []
+anticheat_risk = "low"
+
+[detection]
+fft_size = 2048
+hop_size = 1024
+onset_threshold = 3.0
+min_event_interval_ms = 100
+
+# 声音类型规则
+[[sound_types]]
+name = "footstep"
+freq_range = [80, 400]
+min_energy_ratio = 0.4
+min_duration_ms = 20
+max_duration_ms = 200
+
+[[sound_types]]
+name = "gunshot"
+freq_range = [2000, 12000]
+min_energy_ratio = 0.3
+min_duration_ms = 5
+max_duration_ms = 100
+
+[[sound_types]]
+name = "vehicle"
+freq_range = [40, 200]
+min_energy_ratio = 0.5
+min_duration_ms = 500
+max_duration_ms = 10000
+
+[[sound_types]]
+name = "generic"
+freq_range = [0, 24000]
+min_energy_ratio = 0.0
+min_duration_ms = 0
+max_duration_ms = 1000

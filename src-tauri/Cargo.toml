@@ -30,6 +30,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 realfft = "3"
+rustfft = "6"
+num-complex = "0.4"
 heapless = "0.8"
 
 # 配置与目录

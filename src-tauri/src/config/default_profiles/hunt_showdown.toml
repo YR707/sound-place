@@ -1,0 +1,43 @@
+# Hunt: Showdown 猎杀对决 profile
+# 反作弊: Easy Anti-Cheat (中等风险)
+# 特点: 脚步声定位重要, 枪声来源判断关键
+
+game_id = "hunt_showdown"
+name = "猎杀对决"
+process_names = ["Hunt_Showdown"]
+anticheat_risk = "medium"
+
+[detection]
+fft_size = 2048
+hop_size = 1024
+# 脚步声灵敏度提高
+onset_threshold = 2.5
+min_event_interval_ms = 80
+
+[[sound_types]]
+name = "footstep"
+freq_range = [100, 500]
+min_energy_ratio = 0.35
+min_duration_ms = 30
+max_duration_ms = 250
+
+[[sound_types]]
+name = "gunshot"
+freq_range = [1500, 14000]
+min_energy_ratio = 0.25
+min_duration_ms = 5
+max_duration_ms = 120
+
+[[sound_types]]
+name = "vehicle"
+freq_range = [40, 200]
+min_energy_ratio = 0.5
+min_duration_ms = 500
+max_duration_ms = 10000
+
+[[sound_types]]
+name = "generic"
+freq_range = [0, 24000]
+min_energy_ratio = 0.0
+min_duration_ms = 0
+max_duration_ms = 1000

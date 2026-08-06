@@ -10,4 +10,4 @@ pub mod ring_buffer;
 pub mod session_filter;
 
 // 公开导出关键类型,供 analysis 模块使用
-pub use ring_buffer::{AudioFrame, StereoFrame};
+pub use ring_buffer::StereoFrame;

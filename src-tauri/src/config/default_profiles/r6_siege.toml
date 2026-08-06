@@ -1,0 +1,43 @@
+# Rainbow Six Siege 彩虹六号围攻 profile
+# 反作弊: BattlEye (中等风险)
+# 特点: 室内 CQB, 脚步声与破坏声关键
+
+game_id = "r6_siege"
+name = "彩虹六号"
+process_names = ["RainbowSix"]
+anticheat_risk = "medium"
+
+[detection]
+fft_size = 2048
+hop_size = 1024
+# 灵敏度略高
+onset_threshold = 2.8
+min_event_interval_ms = 70
+
+[[sound_types]]
+name = "footstep"
+freq_range = [80, 500]
+min_energy_ratio = 0.4
+min_duration_ms = 20
+max_duration_ms = 200
+
+[[sound_types]]
+name = "gunshot"
+freq_range = [1000, 16000]
+min_energy_ratio = 0.3
+min_duration_ms = 5
+max_duration_ms = 100
+
+[[sound_types]]
+name = "vehicle"
+freq_range = [40, 200]
+min_energy_ratio = 0.5
+min_duration_ms = 500
+max_duration_ms = 10000
+
+[[sound_types]]
+name = "generic"
+freq_range = [0, 24000]
+min_energy_ratio = 0.0
+min_duration_ms = 0
+max_duration_ms = 1000
