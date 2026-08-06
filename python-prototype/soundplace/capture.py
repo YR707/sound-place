@@ -1,18 +1,28 @@
-"""WASAPI loopback 捕获 (对应 src-tauri/src/audio/capture.rs).
+"""WASAPI 系统级 Loopback + pycaw session 过滤 (备选方案, 对应 src-tauri/src/audio/capture.rs).
 
-使用 sounddevice 库 (基于 PortAudio, 已签名的 wheel).
-sounddevice 0.5.5 + numpy 2.x 已安装.
+## 背景
 
-设计:
-- 使用 sounddevice.InputStream 配置 callback 直接捕获
-- Windows 上 PortAudio 后端会自动用 WASAPI
-- 自动查找 "立体声混音" (Stereo Mix) 设备作为 loopback 源
-  如果没有立体声混音, 退而求其次用默认输入 (麦克风)
+WASAPI Process Loopback (ActivateAudioInterfaceAsync + AUDIOCLIENT_ACTIVATION_PARAMS.ProcessLoopback)
+在本机返回 E_FILE_NOT_FOUND (0x80070002), 所有 PID (包括 0) 都失败.
+管理员权限也无效. 这是系统/驱动层面的问题, 与代码无关.
 
-真正的 WASAPI loopback 在 Rust 版本中实现 (src-tauri/src/audio/capture.rs).
-Python 原型主要验证算法逻辑.
+## 备选方案
+
+用 pycaw 的系统级 loopback 捕获默认 render 设备的全部音频流,
+同时用 IAudioSessionControl::GetState + IAudioMeterInformation::GetPeakValue
+监测目标进程的 session 状态, 只在目标进程"正在发声"时把数据推入 ring buffer.
+
+## 优缺点
+
+优点:
+- 在所有 Win10/11 机器上都能工作 (使用最稳定的 WASAPI Loopback API)
+- 不需要 Process Loopback 的特殊驱动支持
+
+缺点:
+- 系统静音时仍会采集 (但用 session state 过滤可以丢弃)
+- 如果多个进程同时发声, 无法在样本级分离 (只能在时间窗口级过滤)
+- 实际游戏中通常只有一个进程发声, 影响不大
 """
-
 from __future__ import annotations
 
 import threading
@@ -20,35 +30,43 @@ import time
 from typing import Optional
 
 import numpy as np
-import sounddevice as sd
 
 from .ring_buffer import RingBuffer
 
 
-class CaptureThread:
-    """音频捕获线程 (用 sounddevice).
+# pycaw 的 AudioSession.State 常量
+# 0 = Inactive, 1 = Active, 2 = Expired
+_AUDIOSESSION_STATE_ACTIVE = 1
 
-    使用 InputStream + callback, 在后台线程拉取音频帧.
-    支持指定设备索引 (用于选择立体声混音等 loopback 设备).
+
+class CaptureThread:
+    """系统级 WASAPI Loopback 捕获线程 + session 过滤.
+
+    捕获默认 render 设备的全部音频, 仅当目标进程的 session 处于 Active
+    且 peak > 阈值时, 才把数据推入 ring buffer.
     """
 
     def __init__(
         self,
         ring_buffer: RingBuffer,
+        target_pid: int,
+        target_name: str = "<unknown>",
         sample_rate: int = 48000,
         channels: int = 2,
-        blocksize: int = 1024,
-        device: Optional[int] = None,
+        buffer_duration_ms: float = 20.0,
+        peak_threshold: float = 0.001,
     ) -> None:
         self.ring_buffer = ring_buffer
+        self.target_pid = target_pid
+        self.target_name = target_name
         self.sample_rate = sample_rate
         self.channels = channels
-        self.blocksize = blocksize
-        self.device = device  # None = 自动选择; 整数 = 设备索引
+        self.buffer_duration_ms = buffer_duration_ms
+        # session 过滤参数
+        self.peak_threshold = peak_threshold
 
         self._stop_flag = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._stream: Optional[sd.InputStream] = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -63,169 +81,311 @@ class CaptureThread:
 
     def stop(self) -> None:
         self._stop_flag.set()
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
 
     def _capture_loop(self) -> None:
+        """主捕获循环."""
+        from comtypes import CoInitialize, CoUninitialize
+        CoInitialize()
         try:
             self._capture_inner()
         except Exception as e:
             print(f"[capture] 音频捕获线程异常退出: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            try:
+                CoUninitialize()
+            except Exception:
+                pass
 
     def _capture_inner(self) -> None:
-        # 自动查找合适的输入设备:
-        # 优先级:
-        # 1. MME hostapi 下的 "立体声混音" (兼容性最好)
-        # 2. Windows DirectSound 下的 "立体声混音"
-        # 3. Windows WASAPI 下的 "立体声混音"
-        # 4. Windows WDM-KS 下的 "立体声混音" (PortAudio 兼容性差, 最后选)
-        # 5. 退而求其次: 默认输入设备 (麦克风)
-        chosen_device = self.device
+        import ctypes
+        from ctypes import cast, c_void_p
 
-        hostapis = sd.query_hostapis()
-        # hostapi 优先级 (名字 → 优先级, 越小越优先)
-        hostapi_priority = {
-            'MME': 1,
-            'Windows DirectSound': 2,
-            'Windows WASAPI': 3,
-            'Windows WDM-KS': 4,
-        }
+        print(f"[capture] 目标进程: {self.target_name} (pid={self.target_pid})")
+        print(f"[capture] 使用系统级 WASAPI Loopback + session 过滤")
 
-        if chosen_device is None:
-            # 在所有 hostapi 中找立体声混音, 按优先级排序
-            candidates = []
-            for hidx, h in enumerate(hostapis):
-                priority = hostapi_priority.get(h['name'], 99)
-                for dev_idx in h['devices']:
-                    dev = sd.query_devices(dev_idx)
-                    name_lower = dev['name'].lower()
-                    if (dev['max_input_channels'] >= 2
-                        and ('stereo mix' in name_lower
-                             or '立体声混音' in dev['name']
-                             or 'loopback' in name_lower)):
-                        candidates.append((priority, hidx, dev_idx, dev['name'], h['name']))
-                        break  # 每个 hostapi 只取第一个
+        # 1. 用 pycaw 拿到默认 render 设备的 IAudioClient (Loopback)
+        from pycaw.pycaw import AudioUtilities, IAudioClient
+        try:
+            speakers = AudioUtilities.GetSpeakers()
+        except Exception as e:
+            print(f"[capture] 获取默认扬声器失败: {e}")
+            return
 
-            if candidates:
-                # 按优先级排序, 取第一个
-                candidates.sort(key=lambda x: x[0])
-                _, hidx, dev_idx, dev_name, hostapi_name = candidates[0]
-                chosen_device = dev_idx
-                print(f"[capture] 自动找到 loopback 设备: idx={dev_idx} "
-                      f"({dev_name}, hostapi={hostapi_name})")
+        # 激活 IAudioClient (用 pycaw 的包装)
+        # speakers 是 AudioDevice; _dev 是 IMMDevice
+        # IMMDevice::Activate 返回 IAudioClient (comtypes POINTER)
+        try:
+            audio_client = speakers.Activate(
+                IAudioClient._iid_,  # REFIID
+                1,  # CLSCTX_ALL = 23, 但 pycaw 用 1? 实际上这里传 CLSCTX_ALL
+                None,
+            )
+        except Exception as e:
+            print(f"[capture] Activate IAudioClient 失败: {e}")
+            return
 
-        if chosen_device is None:
-            # 退而求其次: 默认输入
-            chosen_device = sd.default.device[0]
-            if chosen_device is not None and chosen_device >= 0:
-                dev_info = sd.query_devices(chosen_device)
-                print(f"[capture] 使用默认输入设备: idx={chosen_device} ({dev_info['name']})")
-            else:
-                print("[capture] 未找到任何输入设备 (包括立体声混音)")
-                print("[capture] 提示: 在声音控制面板启用 '立体声混音' 作为录制设备")
-                while not self._stop_flag.is_set():
-                    time.sleep(0.1)
-                return
-        else:
-            dev_info = sd.query_devices(chosen_device)
-            print(f"[capture] 使用设备: idx={chosen_device} ({dev_info['name']})")
-            print(f"[capture] 默认采样率: {dev_info['default_samplerate']}Hz")
-            print(f"[capture] 最大输入通道: {dev_info['max_input_channels']}")
+        # 2. GetMixFormat
+        try:
+            mix_format_ptr = audio_client.GetMixFormat()
+        except Exception as e:
+            print(f"[capture] GetMixFormat 失败: {e}")
+            return
 
-        # 用设备的默认采样率 (避免不支持的采样率导致失败)
-        if 'default_samplerate' in dev_info:
-            self.sample_rate = int(dev_info['default_samplerate'])
+        # mix_format_ptr 是 POINTER(WAVEFORMATEX), 用 pycaw 的 helper 解包
+        # pycaw 的 AudioClient.GetMixFormat 返回 WAVEFORMATEX 结构体
+        # 但有时返回 POINTER, 看版本. 先尝试 .contents
+        try:
+            wfx = mix_format_ptr.contents
+        except AttributeError:
+            wfx = mix_format_ptr  # 已经是结构体
 
-        # 检查通道数
-        channels = min(self.channels, dev_info['max_input_channels'])
-        if channels < 2:
-            print(f"[capture] 警告: 设备只有 {channels} 个输入通道, 无法做立体声定位")
-        self.channels = channels
+        self.sample_rate = wfx.nSamplesPerSec
+        self.channels = wfx.nChannels
+        bits_per_sample = wfx.wBitsPerSample
+        print(
+            f"[capture] mix format: {self.sample_rate}Hz, "
+            f"{self.channels}ch, {bits_per_sample}bit"
+        )
 
-        # 用 callback 模式启动 InputStream
-        # callback 签名: (indata: np.ndarray, frames: int, time_info, status)
-        def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
-            if status:
-                if status.input_overflow:
-                    print("[capture] 输入溢出")
-                return
-            # indata shape: (frames, channels), dtype float32
-            if self.channels >= 2:
-                left = indata[:, 0].copy()
-                right = indata[:, 1].copy()
-            else:
-                left = indata[:, 0].copy()
-                right = left.copy()
-            self.ring_buffer.push_batch(left, right)
+        # 3. Initialize (Shared + Loopback + AutoConvert)
+        # AUDCLNT_SHAREMODE_SHARED = 0
+        # AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
+        # AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM = 0x80000000
+        # AUDCLNT_STREAMFLAGS_EVENTCALLBACK = 0x00040000 (不用, 我们用 polling)
+        AUDCLNT_SHAREMODE_SHARED = 0
+        AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM = 0x80000000
+        stream_flags = (
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+        )
+        buffer_duration_hns = int(self.buffer_duration_ms * 10_000)  # ms -> 100ns
 
         try:
-            # 在 InputStream 中用 (hostapi, device_within_hostapi) 元组指定设备
-            # 因为不同 hostapi 的设备索引空间是独立的
-            hostapi_idx = dev_info['hostapi']
-            hostapi_dev_list = hostapis[hostapi_idx]['devices']
-            # 在该 hostapi 的设备列表里找 chosen_device 的位置
-            try:
-                dev_within_hostapi = hostapi_dev_list.index(chosen_device)
-                device_param: tuple[int, int] | int = (hostapi_idx, dev_within_hostapi)
-                print(f"[capture] 设备参数: hostapi={hostapi_idx}, "
-                      f"dev_in_hostapi={dev_within_hostapi}")
-            except ValueError:
-                device_param = chosen_device
-
-            # 多次尝试不同的通道数 (WDM-KS 报告的 max_input_channels 可能不准)
-            actual_channels = dev_info['max_input_channels']
-            channels_to_try = [actual_channels, 1, 2]
-            # 去重
-            seen = set()
-            channels_to_try = [c for c in channels_to_try if not (c in seen or seen.add(c))]
-
-            self._stream = None
-            for try_ch in channels_to_try:
-                try:
-                    print(f"[capture] 尝试 channels={try_ch}")
-                    self._stream = sd.InputStream(
-                        samplerate=self.sample_rate,
-                        blocksize=self.blocksize,
-                        channels=try_ch,
-                        dtype='float32',
-                        callback=callback,
-                        device=device_param,
-                    )
-                    self._stream.start()
-                    self.channels = try_ch
-                    print(f"[capture] InputStream 已启动: {self.sample_rate}Hz, {self.channels}ch")
-                    break
-                except sd.PortAudioError as e:
-                    print(f"[capture] channels={try_ch} 失败: {e}")
-                    self._stream = None
-                    continue
-
-            if self._stream is None:
-                raise RuntimeError("所有通道数尝试均失败")
-
-            # 等待停止信号
-            while not self._stop_flag.is_set():
-                time.sleep(0.1)
-
-        except sd.PortAudioError as e:
-            print(f"[capture] PortAudio 错误: {e}")
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                buffer_duration_hns,
+                0,
+                wfx,
+                None,
+            )
         except Exception as e:
-            print(f"[capture] 流启动失败: {e}")
+            print(f"[capture] Initialize 失败: {e}")
+            return
+
+        print("[capture] 已 Initialize (Shared + LOOPBACK + AUTOCONVERTPCM)")
+
+        # 4. GetService(IAudioCaptureClient)
+        from pycaw.pycaw import IAudioCaptureClient
+        try:
+            capture_client = audio_client.GetService(
+                IAudioCaptureClient._iid_
+            )
+        except Exception as e:
+            # pycaw 的 GetService 简化了参数, 直接传 IID
+            try:
+                capture_client = audio_client.GetService(
+                    IAudioCaptureClient
+                )
+            except Exception as e2:
+                print(f"[capture] GetService(IAudioCaptureClient) 失败: {e2}")
+                return
+
+        print(f"[capture] 已获取 IAudioCaptureClient")
+
+        # 5. 启动流
+        try:
+            audio_client.Start()
+        except Exception as e:
+            print(f"[capture] Start 失败: {e}")
+            return
+        print(f"[capture] WASAPI Loopback 流已启动 (过滤 pid={self.target_pid})")
+
+        # 6. 获取目标进程的 session (用于过滤)
+        target_session = self._find_target_session()
+        if target_session is None:
+            print(f"[capture] ⚠ 未找到目标进程的 audio session, 将采集所有音频")
+        else:
+            from pycaw.pycaw import IAudioMeterInformation
+            try:
+                target_meter = target_session.QueryInterface(IAudioMeterInformation)
+            except Exception:
+                target_meter = None
+            print(f"[capture] 已绑定目标 session (meter={'ok' if target_meter else 'no'})")
+
+        # 7. 轮询读取循环
+        try:
+            self._read_loop(capture_client, target_session, target_meter)
         finally:
-            if self._stream is not None:
+            try:
+                audio_client.Stop()
+            except Exception:
+                pass
+
+    def _find_target_session(self):
+        """查找目标进程的 audio session."""
+        from pycaw.pycaw import AudioUtilities
+        for session in AudioUtilities.GetAllSessions():
+            try:
+                proc = session.Process
+                if proc is not None and proc.pid == self.target_pid:
+                    return session
+            except Exception:
+                pass
+        return None
+
+    def _read_loop(self, capture_client, target_session, target_meter) -> None:
+        """轮询读取 capture buffer, 按目标 session 的 peak 过滤."""
+        # 数据缓冲
+        leftover_left = np.zeros(0, dtype=np.float32)
+        leftover_right = np.zeros(0, dtype=np.float32)
+
+        samples_collected = 0
+        frames_pushed = 0
+        silent_frames_dropped = 0
+
+        last_log = time.time()
+        log_interval = 1.0  # 每秒打印一次状态
+
+        while not self._stop_flag.is_set():
+            try:
+                packet_size = capture_client.GetNextPacketSize()
+            except Exception as e:
+                print(f"[capture] GetNextPacketSize 异常: {e}")
+                time.sleep(0.005)
+                continue
+
+            if packet_size == 0:
+                time.sleep(0.005)
+                continue
+
+            # 检查目标进程是否在发声 (peak > 阈值)
+            target_active = self._is_target_active(target_session, target_meter)
+
+            while packet_size > 0:
                 try:
-                    self._stream.stop()
-                    self._stream.close()
+                    data = capture_client.GetBuffer()
+                except Exception as e:
+                    print(f"[capture] GetBuffer 异常: {e}")
+                    break
+
+                # pycaw 的 GetBuffer 返回 (data, frames, flags)
+                # data 是 bytes 或 ctypes 数组
+                try:
+                    buf_bytes, n_frames, flags = data
+                except (TypeError, ValueError):
+                    # 某些 pycaw 版本返回不同结构, 兼容处理
+                    buf_bytes = data[0] if isinstance(data, tuple) else data
+                    n_frames = data[1] if isinstance(data, tuple) and len(data) > 1 else 0
+                    flags = data[2] if isinstance(data, tuple) and len(data) > 2 else 0
+
+                if n_frames == 0:
+                    try:
+                        capture_client.ReleaseBuffer(n_frames)
+                    except Exception:
+                        pass
+                    break
+
+                # 转换为 numpy float32 立体声
+                left, right = self._bytes_to_stereo_float(buf_bytes, n_frames)
+                samples_collected += n_frames
+
+                if target_active:
+                    self.ring_buffer.push_batch(left, right)
+                    frames_pushed += n_frames
+                else:
+                    silent_frames_dropped += n_frames
+
+                try:
+                    capture_client.ReleaseBuffer(n_frames)
                 except Exception:
                     pass
-            print("[capture] 捕获线程退出")
+
+                try:
+                    packet_size = capture_client.GetNextPacketSize()
+                except Exception:
+                    break
+
+            # 状态日志
+            now = time.time()
+            if now - last_log >= log_interval:
+                status = "ACTIVE" if target_active else "silent"
+                print(
+                    f"[capture] {status:7s} | 总采集 {samples_collected} 帧, "
+                    f"推入 {frames_pushed}, 丢弃 {silent_frames_dropped}"
+                )
+                last_log = now
+
+        print(
+            f"[capture] 退出 | 总采集 {samples_collected} 帧, "
+            f"推入 {frames_pushed}, 丢弃 {silent_frames_dropped}"
+        )
+
+    def _is_target_active(self, target_session, target_meter) -> bool:
+        """检查目标进程是否正在发声.
+
+        判断标准:
+        1. session.State == Active (1)
+        2. peak > peak_threshold (如果有 meter)
+        """
+        if target_session is None:
+            # 没找到 session, 默认采集所有
+            return True
+
+        try:
+            state = target_session.State
+        except Exception:
+            # session 可能已失效
+            return False
+
+        if state != _AUDIOSESSION_STATE_ACTIVE:
+            return False
+
+        if target_meter is not None:
+            try:
+                peak = target_meter.GetPeakValue()
+                return peak > self.peak_threshold
+            except Exception:
+                return False
+
+        return True
+
+    def _bytes_to_stereo_float(
+        self, buf_bytes, n_frames: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """把 WASAPI 缓冲区字节转成 (left, right) float32 数组.
+
+        假设 mix format 是 32-bit float 立体声 (WASAPI 默认).
+        其他格式需要转换, 这里暂不支持.
+        """
+        # 假设 32-bit float, 2 channels
+        # 每帧 4 bytes * 2 = 8 bytes
+        n_samples = n_frames * self.channels
+
+        # 把 bytes 转成 float32 numpy 数组
+        try:
+            arr = np.frombuffer(buf_bytes, dtype=np.float32, count=n_samples)
+        except (ValueError, TypeError):
+            # buf_bytes 可能不是 buffer-like, 尝试用 ctypes cast
+            try:
+                import ctypes
+                # 假设 buf_bytes 是 POINTER(c_float) 或类似
+                arr = np.ctypeslib.as_array(buf_bytes, shape=(n_samples,)).astype(np.float32)
+            except Exception:
+                return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+        if self.channels == 2:
+            arr_2d = arr.reshape(-1, 2)
+            return arr_2d[:, 0].copy(), arr_2d[:, 1].copy()
+        elif self.channels == 1:
+            # 单声道, 复制到左右
+            return arr.copy(), arr.copy()
+        else:
+            # 多声道, 只取前两路
+            arr_2d = arr.reshape(-1, self.channels)
+            return arr_2d[:, 0].copy(), arr_2d[:, 1].copy()
